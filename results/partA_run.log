@@ -1,0 +1,18 @@
+ER DD: 83 edges, positive definite True, zeros off the network True
+ER PO: 83 edges, positive definite True, zeros off the network True
+hub DD: 36 edges, positive definite True, zeros off the network True
+hub PO: 36 edges, positive definite True, zeros off the network True
+420 runs on 8 workers
+  42/420 runs done, 438s
+  84/420 runs done, 7743s
+  126/420 runs done, 12510s
+  168/420 runs done, 13101s
+  210/420 runs done, 13325s
+  252/420 runs done, 13644s
+  294/420 runs done, 13774s
+  336/420 runs done, 14029s
+  378/420 runs done, 14226s
+  420/420 runs done, 14348s
+glasso solver failures: 4 of 10500 fits on all the data
+saved /Users/parashar/Documents/osn/results/partA_roc.npz
+python code/partA_run.py 35  18135.00s user 72.68s system 126% cpu 3:59:10.45 total
