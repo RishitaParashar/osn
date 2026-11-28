@@ -1,6 +1,6 @@
 """Part A: networks, precision matrices Q, and samples.
 
-Two networks:   Erdos-Renyi (ER) and hub.
+Networks:       Erdos-Renyi (ER), chain (used in the final run) and hub (used at p = 40).
 Two Q methods (Oct 30 lecture): diagonal dominance (DD) and partial orthogonalization (PO).
 """
 import numpy as np
@@ -13,6 +13,14 @@ def er_adj(p, pi, rng):
     """Each pair (i<j) is an edge independently with probability pi."""
     upper = np.triu(rng.random((p, p)) < pi, k=1)
     return (upper | upper.T).astype(int)
+
+
+def chain_adj(p):
+    """Chain (path) network: node i is joined to node i+1, so p-1 edges, max degree 2."""
+    A = np.zeros((p, p), dtype=int)
+    i = np.arange(p - 1)
+    A[i, i + 1] = A[i + 1, i] = 1
+    return A
 
 
 def hub_adj(p, n_hubs=3, deg=12, rng=None):

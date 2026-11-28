@@ -1,12 +1,15 @@
 """Part A experiment: ROC curves, and lambda chosen by 5-fold CV and by BIC.
 
 Design (project handout, both versions):
-  networks   Erdos-Renyi (pi = 0.1) and hub (3 hubs x 12 neighbours), p = 40
+  networks   Erdos-Renyi (pi = 0.05) and chain (i -- i+1), p = 60
   Q methods  diagonal dominance (DD) and partial orthogonalization (PO), Oct 30 lecture
-  N          20, 100, 400  (one with N < p)
+  N          40, 100, 200  (one with N < p)
   runs       35 per setting; Q fixed, fresh data in every run
-  estimators graphical lasso and neighbourhood selection with the OR rule
+  estimators graphical lasso, and neighbourhood selection with the OR and the AND rule
+             (both rules come from the same p lasso fits, so AND costs nothing extra)
   lambda     common relative grid lambda = r * lambda_max, r from 1 to 0.01
+  selection  5-fold CV; the mean and the standard error of the fold scores are saved, so
+             both the CV-min rule and the one-standard-error rule can be applied (BIC too)
 
 Every Q is shifted to lambda_min(Q) = 0.1 (Oct 30 lecture, slide 25). This keeps the two
 generators comparable and avoids the near-singular Q that made glasso fail before; the
@@ -29,26 +32,25 @@ import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from sklearn.covariance import graphical_lasso
 from sklearn.linear_model import lasso_path
-from partA_generate import er_adj, hub_adj, make_Q, sample_gaussian, checks
+from partA_generate import er_adj, chain_adj, make_Q, sample_gaussian, checks
 
 # At the smallest lambda glasso can stop at max_iter; that is expected (the graph there is
 # almost complete) and is not a failure. Set at import so every worker process inherits it.
 warnings.filterwarnings("ignore")
 
-P = 40
-PI_ER = 0.1
-HUBS, HUB_DEG = 3, 12
+P = 60
+PI_ER = 0.05
 LAM_MIN = 0.1
-N_LIST = [20, 100, 400]                    # N/p = 0.5, 2.5, 10
+N_LIST = [40, 100, 200]                    # N/p = 0.67, 1.67, 3.33
 R_RUNS = int(sys.argv[1]) if len(sys.argv) > 1 else 35
 N_WORKERS = int(sys.argv[2]) if len(sys.argv) > 2 else os.cpu_count()
 R_GRID = np.logspace(0, -2, 25)            # decreasing lambda
 K_FOLDS = 5
 GLASSO_MAX_ITER = 300
-NETS = ["ER", "hub"]
+NETS = ["ER", "chain"]
 METHODS = ["DD", "PO"]
-ESTIMATORS = ["glasso", "neigh_OR"]
-FIELDS = ["TPR", "FPR", "F1", "NEDGES", "BIC", "CV"]
+ESTIMATORS = ["glasso", "neigh_OR", "neigh_AND"]
+FIELDS = ["TPR", "FPR", "F1", "NEDGES", "BIC", "CV", "CV_SE"]
 SEED = 2026
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 OUT = os.path.join(ROOT, "results", "partA_roc.npz")
@@ -101,15 +103,15 @@ def glasso_all(X, lams, folds):
         E = edges_of(prec)
         edges.append(E)
         bic[i] = N * neg_loglik(prec, S) + np.log(N) * (E.sum() // 2)
-    cv = np.zeros(len(lams))
-    for test in folds:
+    cv = np.zeros((len(folds), len(lams)))      # held-out score of each fold
+    for k, test in enumerate(folds):
         train = np.setdiff1d(np.arange(N), test)
         mu = X[train].mean(0)
         Xtr, Xte = X[train] - mu, X[test] - mu
         Str, Ste = Xtr.T @ Xtr / len(train), Xte.T @ Xte / len(test)
         for i, lam in enumerate(lams):
             prec = glasso_fit(Str, lam)
-            cv[i] += np.inf if prec is None else neg_loglik(prec, Ste) / len(folds)
+            cv[k, i] = np.inf if prec is None else neg_loglik(prec, Ste)
     return edges, bic, cv
 
 
@@ -124,7 +126,7 @@ def lasso_coefs(Xtr, j, lams):
 
 
 def neigh_all(X, lams, folds):
-    """OR-rule edges and BIC on all the data, and the 5-fold CV prediction error."""
+    """OR- and AND-rule edges and BIC on all the data, and the 5-fold CV prediction error."""
     N, p = X.shape
     Xc = X - X.mean(0)
     B = np.zeros((len(lams), p, p), dtype=bool)
@@ -135,18 +137,19 @@ def neigh_all(X, lams, folds):
         B[:, j, others] = nz.T
         rss = ((Xc[:, [j]] - Xc[:, others] @ coefs) ** 2).sum(0)
         bic += N * np.log(np.maximum(rss / N, 1e-12)) + np.log(N) * nz.sum(0)
-    E = B | B.transpose(0, 2, 1)
+    E_or = B | B.transpose(0, 2, 1)            # edge if j picks k OR k picks j
+    E_and = B & B.transpose(0, 2, 1)           # edge if j picks k AND k picks j
     for i in range(len(lams)):
-        np.fill_diagonal(E[i], False)
-    cv = np.zeros(len(lams))
-    for test in folds:
+        np.fill_diagonal(E_or[i], False); np.fill_diagonal(E_and[i], False)
+    cv = np.zeros((len(folds), len(lams)))      # held-out squared error of each fold
+    for k, test in enumerate(folds):
         train = np.setdiff1d(np.arange(N), test)
         mu = X[train].mean(0)
         Xtr, Xte = X[train] - mu, X[test] - mu
         for j in range(p):
             others, coefs = lasso_coefs(Xtr, j, lams)
-            cv += ((Xte[:, [j]] - Xte[:, others] @ coefs) ** 2).sum(0) / N
-    return list(E), bic, cv
+            cv[k] += ((Xte[:, [j]] - Xte[:, others] @ coefs) ** 2).sum(0) / len(test)
+    return {"neigh_OR": list(E_or), "neigh_AND": list(E_and)}, bic, cv
 
 
 # ---------- one run ----------
@@ -160,15 +163,24 @@ def one_run(a, b, c, run, Q, adj, N):
     folds = np.array_split(rng.permutation(N), K_FOLDS)
     truth = adj.astype(bool)
     out, fails = {}, 0
-    for est, fn in [("glasso", glasso_all), ("neigh_OR", neigh_all)]:
-        E_list, bic, cv = fn(X, lams, folds)
+    fits = {}
+    E_g, bic_g, cv_g = glasso_all(X, lams, folds)
+    fits["glasso"] = (E_g, bic_g, cv_g)
+    E_n, bic_n, cv_n = neigh_all(X, lams, folds)
+    for est in ["neigh_OR", "neigh_AND"]:
+        fits[est] = (E_n[est], bic_n, cv_n)    # same regressions, so same BIC and CV
+    for est in ESTIMATORS:
+        E_list, bic, cv = fits[est]
         arr = {f: np.full(len(lams), np.nan) for f in ["TPR", "FPR", "F1", "NEDGES"]}
         for g, E in enumerate(E_list):
             if E is None:
-                fails += 1
+                fails += est == "glasso"
                 continue
             arr["TPR"][g], arr["FPR"][g], arr["F1"][g], arr["NEDGES"][g] = scores(E, truth)
-        arr["BIC"], arr["CV"] = bic, cv
+        arr["BIC"] = bic
+        with np.errstate(invalid="ignore"):
+            arr["CV"] = cv.mean(0)                              # CV score (mean over folds)
+            arr["CV_SE"] = cv.std(0, ddof=1) / np.sqrt(len(folds))   # its standard error
         out[est] = arr
     return (a, b, c, run), out, fails
 
@@ -179,7 +191,7 @@ def main():
     adjs = np.zeros((len(NETS), P, P), dtype=int)
     Qs = np.zeros((len(NETS), len(METHODS), P, P))
     for a, net in enumerate(NETS):
-        adjs[a] = er_adj(P, PI_ER, rng) if net == "ER" else hub_adj(P, HUBS, HUB_DEG, rng)
+        adjs[a] = er_adj(P, PI_ER, rng) if net == "ER" else chain_adj(P)
         for b, method in enumerate(METHODS):
             Qs[a, b] = make_Q(adjs[a], method, rng, lam_min=LAM_MIN)
             ch = checks(Qs[a, b], adjs[a])
