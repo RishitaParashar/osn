@@ -1,4 +1,4 @@
-| Network | Method | Edges | Edge strength mean | median | range |
+| Network | Q method | Edges | Edge strength mean | median | range |
 |---|---|---|---|---|---|
 | ER | DD | 67 | 0.321 | 0.325 | 0.001 – 0.856 |
 | ER | PO | 67 | 0.199 | 0.152 | 0.002 – 0.888 |

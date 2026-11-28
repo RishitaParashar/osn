@@ -1,11 +1,15 @@
-"""Own implementations of the two estimators (Part A/B).
+"""Own implementations of the two estimators used in the project.
 
-1. lasso_cd: coordinate-descent lasso for one regression.
-   Objective:  (1/(2n)) ||y - X b||^2 + lam * sum_j w_j |b_j|
-2. neighbourhood_selection: one lasso per node; combine with OR / AND rule.
-3. glasso_support: wrapper around sklearn's graphical lasso (existing software).
+1. lasso_cd:               coordinate-descent lasso for one regression (our own solver).
+2. neighbourhood_selection: one lasso per node, combined with the AND rule (default).
+3. neighbourhood_path:      the same, for a whole grid of lambda values (used by Parts A and B).
+4. glasso_support:          graphical lasso from sklearn (existing software) -> edge support.
+
+The AND rule is the one used in every result of the project. The OR rule is kept only so that
+the comparison in the report can be reproduced.
 """
 import numpy as np
+from sklearn.linear_model import lasso_path
 
 
 def soft(z, t):
@@ -41,26 +45,46 @@ def lasso_cd(X, y, lam, w=None, n_iter=500, tol=1e-8):
     return b
 
 
-def neighbourhood_selection(X, lam, rule="or"):
-    """Estimate the support of Q by regressing each variable on all others.
-
-    For node j, regress X_j on X_{-j}. Coefficient beta_jk != 0 means k is a
-    neighbour of j. The two rules disagree when only one direction is selected:
-      'or'  : edge (j,k) if beta_jk != 0 OR  beta_kj != 0
-      'and' : edge (j,k) only if beta_jk != 0 AND beta_kj != 0
-    Returns a boolean p x p symmetric adjacency matrix with zero diagonal.
-    """
-    n, p = X.shape
-    Xc = X - X.mean(axis=0)                     # centre each variable
-    B = np.zeros((p, p))
-    for j in range(p):
-        idx = [k for k in range(p) if k != j]
-        beta = lasso_cd(Xc[:, idx], Xc[:, j], lam)
-        B[j, idx] = beta
-    nz = B != 0
-    adj = (nz | nz.T) if rule == "or" else (nz & nz.T)
+def _combine(nz, rule):
+    """Symmetric adjacency from the directed selection matrix nz (nz[j, k] = k picked by j)."""
+    adj = (nz & nz.T) if rule == "and" else (nz | nz.T)
     np.fill_diagonal(adj, False)
     return adj
+
+
+def neighbourhood_selection(X, lam, rule="and"):
+    """Estimate the support of Q by regressing each variable on all others (one lasso per node).
+
+    Node j regresses X_j on X_{-j}; a nonzero coefficient beta_jk means k is a neighbour of j.
+    The rule decides when the two directions disagree:
+      'and' (default): edge (j,k) only if beta_jk != 0 AND beta_kj != 0
+      'or'           : edge (j,k) if beta_jk != 0 OR  beta_kj != 0
+    Uses our lasso_cd. Returns a boolean p x p symmetric matrix with zero diagonal.
+    """
+    n, p = X.shape
+    Xc = X - X.mean(axis=0)
+    nz = np.zeros((p, p), dtype=bool)
+    for j in range(p):
+        idx = [k for k in range(p) if k != j]
+        nz[j, idx] = lasso_cd(Xc[:, idx], Xc[:, j], lam) != 0
+    return _combine(nz, rule)
+
+
+def neighbourhood_path(X, lams, rule="and"):
+    """The same estimator for a list of lambdas, using sklearn's lasso_path for speed.
+
+    sklearn's lasso_path minimises the same objective as lasso_cd (see check_solver.py, which
+    shows the two agree). Returns a list of boolean p x p matrices, one per lambda.
+    """
+    n, p = X.shape
+    Xc = X - X.mean(axis=0)
+    lams = np.asarray(lams, dtype=float)
+    B = np.zeros((len(lams), p, p), dtype=bool)
+    for j in range(p):
+        others = np.delete(np.arange(p), j)
+        alphas, coefs, _ = lasso_path(Xc[:, others], Xc[:, j], alphas=lams, max_iter=5000)
+        B[:, j, others] = (coefs != 0).T
+    return [_combine(B[g], rule) for g in range(len(lams))]
 
 
 def glasso_support(X, lam):

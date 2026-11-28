@@ -1,25 +1,22 @@
-"""Part A experiment: ROC curves, and lambda chosen by 5-fold CV and by BIC.
+"""Part A experiment: ROC curves of two estimators on data with a known network.
 
-Design (project handout, both versions):
-  networks   Erdos-Renyi (pi = 0.05) and chain (i -- i+1), p = 60
-  Q methods  diagonal dominance (DD) and partial orthogonalization (PO), Oct 30 lecture
-  N          40, 100, 200  (one with N < p)
-  runs       35 per setting; Q fixed, fresh data in every run
-  estimators graphical lasso, and neighbourhood selection with the OR and the AND rule
-             (both rules come from the same p lasso fits, so AND costs nothing extra)
-  lambda     common relative grid lambda = r * lambda_max, r from 1 to 0.01
-  selection  5-fold CV; the mean and the standard error of the fold scores are saved, so
-             both the CV-min rule and the one-standard-error rule can be applied (BIC too)
+Design (v2 handout, steps 1-6):
+  networks    Erdos-Renyi (pi = 0.05) and chain (i -- i+1), p = 60
+  Q methods   diagonal dominance (DD) and partial orthogonalization (PO), Oct 30 lecture
+  N           40, 100, 200   (N = 40 < p)
+  estimators  graphical lasso, and neighbourhood selection with the AND rule
+  lambda      common relative grid lambda = r * lambda_max, r from 1 to 0.01 (25 values)
+  runs        35 per setting; Q fixed, fresh data in every run
+At every lambda the TPR and FPR are recorded; partA_plot.py averages them over runs (ROC).
 
-Every Q is shifted to lambda_min(Q) = 0.1 (Oct 30 lecture, slide 25). This keeps the two
-generators comparable and avoids the near-singular Q that made glasso fail before; the
-v2 handout no longer asks to report lambda_min.
+Every Q is shifted to lambda_min(Q) = 0.1 (Oct 30 lecture, slide 25) so the two generators
+are comparable and glasso does not fail on near-singular Q.
 
-For both estimators lambda_max = max_{j != k} |S_jk| (glasso: Check 1 of the glasso
-slides; lasso of x_j on X_{-j}: max_k |x_k^T x_j| / N, the same number).
+For both estimators lambda_max = max_{j != k} |S_jk| (glasso: Check 1 of the glasso slides;
+lasso of x_j on X_{-j}: max_k |x_k^T x_j| / N, the same number).
 
-The 420 runs (12 settings x 35) are independent and run in parallel. Run (a, b, c, run)
-uses its own seed [SEED, a, b, c, run], so results do not depend on the number of cores.
+Run (a, b, c, run) uses its own seed [SEED, a, b, c, run], so results do not depend on the
+number of cores.
 
 Usage: python code/partA_run.py [n_runs] [n_workers]      (defaults 35, all cores)
 """
@@ -31,11 +28,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from sklearn.covariance import graphical_lasso
-from sklearn.linear_model import lasso_path
 from partA_generate import er_adj, chain_adj, make_Q, sample_gaussian, checks
+from solvers import neighbourhood_path
 
 # At the smallest lambda glasso can stop at max_iter; that is expected (the graph there is
-# almost complete) and is not a failure. Set at import so every worker process inherits it.
+# almost complete) and is not a failure. Set at import so every worker inherits it.
 warnings.filterwarnings("ignore")
 
 P = 60
@@ -45,114 +42,42 @@ N_LIST = [40, 100, 200]                    # N/p = 0.67, 1.67, 3.33
 R_RUNS = int(sys.argv[1]) if len(sys.argv) > 1 else 35
 N_WORKERS = int(sys.argv[2]) if len(sys.argv) > 2 else os.cpu_count()
 R_GRID = np.logspace(0, -2, 25)            # decreasing lambda
-K_FOLDS = 5
 GLASSO_MAX_ITER = 300
 NETS = ["ER", "chain"]
 METHODS = ["DD", "PO"]
-ESTIMATORS = ["glasso", "neigh_OR", "neigh_AND"]
-FIELDS = ["TPR", "FPR", "F1", "NEDGES", "BIC", "CV", "CV_SE"]
+ESTIMATORS = ["glasso", "neigh_AND"]
+FIELDS = ["TPR", "FPR", "NEDGES"]
 SEED = 2026
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 OUT = os.path.join(ROOT, "results", "partA_roc.npz")
 
 
-# ---------- scoring ----------
-
-def scores(E, truth):
-    """TPR, FPR, F1 and number of edges over unordered pairs i<j (handout definitions)."""
+def rates(E, truth):
+    """TPR, FPR and number of edges over unordered pairs i<j (handout definitions)."""
     iu = np.triu_indices(truth.shape[0], k=1)
     e, t = E[iu], truth[iu]
-    tp = np.sum(e & t); fp = np.sum(e & ~t); fn = np.sum(~e & t)
-    return tp / t.sum(), fp / (t.size - t.sum()), 2 * tp / (2 * tp + fp + fn), e.sum()
+    tp = np.sum(e & t); fp = np.sum(e & ~t)
+    return tp / t.sum(), fp / (t.size - t.sum()), e.sum()
 
 
-# ---------- graphical lasso ----------
-
-def glasso_fit(S, lam):
-    """Precision matrix from sklearn's glasso, or None if the solver fails."""
-    try:
-        _, prec = graphical_lasso(S, alpha=lam, mode="cd", max_iter=GLASSO_MAX_ITER)
-        return prec
-    except Exception:
-        return None
-
-
-def edges_of(prec):
-    E = np.abs(prec) > 1e-8
-    np.fill_diagonal(E, False)
-    return E
+def glasso_edges(S, lams):
+    """Edge sets of the graphical lasso at each lambda (None where the solver fails)."""
+    out = []
+    for lam in lams:
+        try:
+            _, prec = graphical_lasso(S, alpha=lam, mode="cd", max_iter=GLASSO_MAX_ITER)
+            E = np.abs(prec) > 1e-8
+            np.fill_diagonal(E, False)
+            out.append(E)
+        except Exception:
+            out.append(None)
+    return out
 
 
-def neg_loglik(prec, S):
-    """Gaussian negative log-likelihood per sample (up to constants): -log det Q + tr(SQ)."""
-    _, logdet = np.linalg.slogdet(prec)
-    return -logdet + np.trace(S @ prec)
+def neigh_and_edges(Xc, lams):
+    """Neighbourhood selection with the AND rule, one lasso per node (solvers.neighbourhood_path)."""
+    return neighbourhood_path(Xc, lams, rule="and")
 
-
-def glasso_all(X, lams, folds):
-    """Edges and BIC on all the data, and the 5-fold CV score, at each lambda."""
-    N = X.shape[0]
-    Xc = X - X.mean(0)
-    S = Xc.T @ Xc / N
-    edges, bic = [], np.full(len(lams), np.nan)
-    for i, lam in enumerate(lams):
-        prec = glasso_fit(S, lam)
-        if prec is None:
-            edges.append(None)
-            continue
-        E = edges_of(prec)
-        edges.append(E)
-        bic[i] = N * neg_loglik(prec, S) + np.log(N) * (E.sum() // 2)
-    cv = np.zeros((len(folds), len(lams)))      # held-out score of each fold
-    for k, test in enumerate(folds):
-        train = np.setdiff1d(np.arange(N), test)
-        mu = X[train].mean(0)
-        Xtr, Xte = X[train] - mu, X[test] - mu
-        Str, Ste = Xtr.T @ Xtr / len(train), Xte.T @ Xte / len(test)
-        for i, lam in enumerate(lams):
-            prec = glasso_fit(Str, lam)
-            cv[k, i] = np.inf if prec is None else neg_loglik(prec, Ste)
-    return edges, bic, cv
-
-
-# ---------- neighbourhood selection ----------
-
-def lasso_coefs(Xtr, j, lams):
-    """Lasso path of column j on the others (same objective as our lasso_cd)."""
-    others = np.delete(np.arange(Xtr.shape[1]), j)
-    alphas, coefs, _ = lasso_path(Xtr[:, others], Xtr[:, j], alphas=lams, max_iter=5000)
-    assert np.allclose(alphas, lams)
-    return others, coefs                   # coefs: (p-1) x n_lams
-
-
-def neigh_all(X, lams, folds):
-    """OR- and AND-rule edges and BIC on all the data, and the 5-fold CV prediction error."""
-    N, p = X.shape
-    Xc = X - X.mean(0)
-    B = np.zeros((len(lams), p, p), dtype=bool)
-    bic = np.zeros(len(lams))
-    for j in range(p):
-        others, coefs = lasso_coefs(Xc, j, lams)
-        nz = coefs != 0
-        B[:, j, others] = nz.T
-        rss = ((Xc[:, [j]] - Xc[:, others] @ coefs) ** 2).sum(0)
-        bic += N * np.log(np.maximum(rss / N, 1e-12)) + np.log(N) * nz.sum(0)
-    E_or = B | B.transpose(0, 2, 1)            # edge if j picks k OR k picks j
-    E_and = B & B.transpose(0, 2, 1)           # edge if j picks k AND k picks j
-    for i in range(len(lams)):
-        np.fill_diagonal(E_or[i], False); np.fill_diagonal(E_and[i], False)
-    cv = np.zeros((len(folds), len(lams)))      # held-out squared error of each fold
-    for k, test in enumerate(folds):
-        train = np.setdiff1d(np.arange(N), test)
-        mu = X[train].mean(0)
-        Xtr, Xte = X[train] - mu, X[test] - mu
-        for j in range(p):
-            others, coefs = lasso_coefs(Xtr, j, lams)
-            cv[k] += ((Xte[:, [j]] - Xte[:, others] @ coefs) ** 2).sum(0) / len(test)
-    return {"neigh_OR": list(E_or), "neigh_AND": list(E_and)}, bic, cv
-
-
-# ---------- one run ----------
 
 def one_run(a, b, c, run, Q, adj, N):
     rng = np.random.default_rng([SEED, a, b, c, run])
@@ -160,33 +85,20 @@ def one_run(a, b, c, run, Q, adj, N):
     Xc = X - X.mean(0)
     S = Xc.T @ Xc / N
     lams = R_GRID * np.abs(S - np.diag(np.diag(S))).max()
-    folds = np.array_split(rng.permutation(N), K_FOLDS)
     truth = adj.astype(bool)
     out, fails = {}, 0
-    fits = {}
-    E_g, bic_g, cv_g = glasso_all(X, lams, folds)
-    fits["glasso"] = (E_g, bic_g, cv_g)
-    E_n, bic_n, cv_n = neigh_all(X, lams, folds)
-    for est in ["neigh_OR", "neigh_AND"]:
-        fits[est] = (E_n[est], bic_n, cv_n)    # same regressions, so same BIC and CV
-    for est in ESTIMATORS:
-        E_list, bic, cv = fits[est]
-        arr = {f: np.full(len(lams), np.nan) for f in ["TPR", "FPR", "F1", "NEDGES"]}
+    for est, E_list in [("glasso", glasso_edges(S, lams)), ("neigh_AND", neigh_and_edges(Xc, lams))]:
+        arr = {f: np.full(len(lams), np.nan) for f in FIELDS}
         for g, E in enumerate(E_list):
             if E is None:
-                fails += est == "glasso"
+                fails += 1
                 continue
-            arr["TPR"][g], arr["FPR"][g], arr["F1"][g], arr["NEDGES"][g] = scores(E, truth)
-        arr["BIC"] = bic
-        with np.errstate(invalid="ignore"):
-            arr["CV"] = cv.mean(0)                              # CV score (mean over folds)
-            arr["CV_SE"] = cv.std(0, ddof=1) / np.sqrt(len(folds))   # its standard error
+            arr["TPR"][g], arr["FPR"][g], arr["NEDGES"][g] = rates(E, truth)
         out[est] = arr
     return (a, b, c, run), out, fails
 
 
 def main():
-    warnings.filterwarnings("ignore")
     rng = np.random.default_rng(SEED)
     adjs = np.zeros((len(NETS), P, P), dtype=int)
     Qs = np.zeros((len(NETS), len(METHODS), P, P))
@@ -219,10 +131,8 @@ def main():
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     np.savez(OUT, NETS=NETS, METHODS=METHODS, ESTIMATORS=ESTIMATORS, N_LIST=N_LIST,
-             R_GRID=R_GRID, P=P, K_FOLDS=K_FOLDS, SEED=SEED, adjs=adjs, Qs=Qs,
-             fails=fails, **res)
-    print("glasso solver failures:", int(fails.sum()), "of",
-          len(jobs) * len(R_GRID), "fits on all the data")
+             R_GRID=R_GRID, P=P, SEED=SEED, adjs=adjs, Qs=Qs, fails=fails, **res)
+    print("glasso solver failures:", int(fails.sum()), "of", len(jobs) * len(R_GRID), "fits")
     print("saved", os.path.abspath(OUT))
 
 

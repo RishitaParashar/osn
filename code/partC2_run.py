@@ -2,7 +2,8 @@
 
 Same Q and the same data as the main Part A run (run seeds [SEED, a, b, c, run], with
 a = chain, b = DD, c = N = 100), so the glasso rows can be compared with the Part A results.
-lambda is chosen by BIC for each method (the rule that was better for glasso in Part A).
+lambda is chosen by BIC for the reweighted fit, and glasso is taken at the lambda with the
+closest number of edges (the v2 handout asks for matched edge counts).
 Metrics: F1 / TPR / FPR of the support, and the bias on the true edges
     bias = mean over true edges (i<j) of (|q_hat_ij| - |q_ij|).
 
